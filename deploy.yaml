@@ -1,0 +1,171 @@
+# Automatically allow docker inside docker functionality
+services:
+  - docker:dind
+variables:
+  DOCKER_HOST: tcp://localhost:2375
+
+# Job name: docker_image_publish
+# Functionality: Authenticate to quandoo's services gcp project and upload build and 
+#                push image into docker repository
+# Requierments: 
+#   - GCR_JSON_KEY: Downloaded service account json key saved into a variable
+#   - SERVICES_PROJECT: GCP project to upload the image to, default qdoo-svc-00
+docker_image_publish:
+  image: docker:stable
+  stage:
+    publish
+  tags:
+    - kubernetes
+  variables:
+    DOCKER_BUILD_PATH: .
+    TAG_VERSION: latest
+  script:
+    - docker build --tag ${CI_PROJECT_NAME} ${BUILD_ARGS} ${DOCKER_BUILD_PATH}
+    - docker tag ${CI_PROJECT_NAME} "eu.gcr.io/${GCR_PROJECT_ID}/${CI_PROJECT_NAME}:${CI_COMMIT_SHORT_SHA}"
+    - docker tag ${CI_PROJECT_NAME} "eu.gcr.io/${GCR_PROJECT_ID}/${CI_PROJECT_NAME}:${CI_PIPELINE_ID}"
+    - docker tag ${CI_PROJECT_NAME} "eu.gcr.io/${GCR_PROJECT_ID}/${CI_PROJECT_NAME}:${TAG_VERSION}"
+    - docker login -u _json_key -p "$(echo $GCR_JSON_KEY | base64 -d)" https://eu.gcr.io
+    - docker push "eu.gcr.io/${GCR_PROJECT_ID}/${CI_PROJECT_NAME}:${CI_COMMIT_SHORT_SHA}"
+    - docker push "eu.gcr.io/${GCR_PROJECT_ID}/${CI_PROJECT_NAME}:${CI_PIPELINE_ID}"
+    - docker push "eu.gcr.io/${GCR_PROJECT_ID}/${CI_PROJECT_NAME}:${TAG_VERSION}"
+
+.gcloud_authentication: &gcloud_authentication |
+    echo "Templated Job - gcloud_authentication"
+    echo ${K8S_AUTHENTICATOR_KEY} | base64 -d > auth_k8s.key
+    gcloud auth activate-service-account --key-file=auth_k8s.key
+
+# Requierments:
+#   - GCP_PROJECT: Google cloud project we will connect to
+#   - GCP_K8S_CLUSTER: Name of kubernetes cluster you want to set into your .kubeconfig
+#     and connect
+#   - GCP_K8S_REGION: Region name of the wanted Kubernetes cluster from variable 
+#     ${GCP_K8S_CLUSTER}
+.kubernetes_authentication: &kubernetes_authentication |
+    echo "Templated Job - kubernetes_authentication"
+    gcloud container clusters get-credentials --project ${GCP_PROJECT} --region ${GCP_K8S_REGION} ${GCP_K8S_CLUSTER}
+
+# Requierments: 
+#   - Make sure to add authentication to kubernetes cluster before
+.destroy_helm_environment: &destroy_helm_environment |
+    echo "destroy ${CI_PROJECT_NAME}-${CI_COMMIT_REF_SLUG}"
+    helm del --purge ${CI_PROJECT_NAME}-${CI_COMMIT_REF_SLUG}
+    kubectl delete namespace ${CI_PROJECT_NAME}-${CI_COMMIT_REF_SLUG}
+
+# Job name: internal_helm_deploy
+# Functionality: Connect to helm repo and install project's helm chart to cluster
+# Requierments: 
+#   - Job's Environment must be set
+# Notes: Using .kubernetes_authentication snippet, look at requierments of the snippet for more info
+.internal_helm_deploy:
+  image: devth/helm:v2.9.1
+  stage: deploy
+  tags:
+    - kubernetes
+  script:
+    # Init helm
+    - set -ex
+    - REPO_NAME=dnr-museum
+    - helm repo add ${REPO_NAME} http://${CHARTMUSEUM_USER}:${CHARTMUSEUM_PASSWORD}@${REPO_IP}/
+    - helm repo update
+
+    # Place holders
+    - VARS_ARGS=""
+
+    # Authenticate to the cluster
+    - *gcloud_authentication
+    - *kubernetes_authentication
+
+    # Build extra arguments passed to the helm install
+    - if [[ ! -z ${CHART_VALUES} ]]; then VARS_ARGS="-f ${CI_PROJECT_DIR}/.helm/${CHART_VALUES}"; fi
+
+    # Build the release name
+    - RELEASE_NAME=${CI_PROJECT_NAME}-${CI_COMMIT_REF_SLUG}
+
+    # iterate over all clusters
+    # Install the helm chart passing all needed args
+    - helm upgrade -i ${RELEASE_NAME} \
+                      ${VARS_ARGS} \
+                      --set image.tag=${CI_COMMIT_SHORT_SHA} \
+                      --set image.repository=eu.gcr.io/${GCR_PROJECT_ID}/${CI_PROJECT_NAME} \
+                      --namespace ${RELEASE_NAME} \
+                      ${REPO_NAME}/${CI_PROJECT_NAME}
+
+## production environment
+### deploy
+deploy_production:
+  image: devth/helm:v2.9.1
+  stage: deploy
+  only: 
+  - master
+  environment:
+    name: production
+    on_stop: destroy_production
+  variables:
+    # chart values
+    CHART_VALUES: production-values.yaml
+    K8S_AUTHENTICATOR_KEY: ${K8S_PROD_KEY}
+    GCP_PROJECT: ${GCP_PROD_PROJECT}
+    GCP_K8S_REGION: ${GCP_PROD_REGION}
+  extends: .internal_helm_deploy
+
+### destroy
+destroy_production:
+  image: devth/helm:v2.9.1
+  stage: deploy
+  variables:
+    # prevent git checkout for deleted branches
+    GIT_STRATEGY: none
+    K8S_AUTHENTICATOR_KEY: ${K8S_PROD_KEY}
+    GCP_PROJECT: ${GCP_PROD_PROJECT}
+    GCP_K8S_REGION: ${GCP_PROD_REGION}
+
+  only:
+  - master
+  script:
+    - *gcloud_authentication
+    - *kubernetes_authentication
+    - *destroy_helm_environment
+  when: manual
+  environment:
+    name: production
+    action: stop
+
+
+## development environment
+### deploy
+deploy_development:
+  image: devth/helm:v2.9.1
+  stage: deploy
+  only: 
+  - master
+  environment:
+    name: development
+    on_stop: destroy_development
+  variables:
+    # chart values
+    CHART_VALUES: development-values.yaml
+    K8S_AUTHENTICATOR_KEY: ${K8S_DEV_KEY}
+    GCP_PROJECT: ${GCP_DEV_PROJECT}
+    GCP_K8S_REGION: ${GCP_DEV_REGION}
+  extends: .internal_helm_deploy
+
+### destroy
+destroy_development:
+  image: devth/helm:v2.9.1
+  stage: deploy
+  variables:
+    # prevent git checkout for deleted branches
+    GIT_STRATEGY: none
+    K8S_AUTHENTICATOR_KEY: ${K8S_DEV_KEY}
+    GCP_PROJECT: ${GCP_DEV_PROJECT}
+    GCP_K8S_REGION: ${GCP_DEV_REGION}
+  only:
+  - master
+  script:
+    - *gcloud_authentication
+    - *kubernetes_authentication
+    - *destroy_helm_environment
+  when: manual
+  environment:
+    name: development
+    action: stop
